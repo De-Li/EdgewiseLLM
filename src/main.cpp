@@ -36,7 +36,7 @@ int main(int argc, char* argv[]) {
   std::string prompt = "";             // prompt string
   std::string prompt_path = "";        // prompt file path
   // Completion mode options
-  int num_steps = 256;                 // number of steps to run for
+  int num_steps = 128;                 // number of steps to run for
 
 	if (argc >= 2) {
 		checkpoint_path = argv[1];
@@ -137,6 +137,7 @@ int main(int argc, char* argv[]) {
     state.cuda();
   }
 
+  std::cout << "Do one inference as warmup." << std::endl;
   // Do one inference as warmup.
   // On CPU, this ensures all tensors are loaded into memory via mmap.
   // On GPU, this ensures all tensors are loaded into device memory and 

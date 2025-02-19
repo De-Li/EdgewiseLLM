@@ -77,6 +77,7 @@ extern "C" void unregister_cuda_host(void* host) {
 
 static int warp_size = 0;
 static int max_threads_per_block = 0;
+static int WARP_SIZE = 32;
 
 extern "C" void set_cuda_device(int device) {
   CUDA_CHECK(cudaSetDevice(device));
@@ -173,23 +174,119 @@ inline float block_all_reduce_sum(float val) {
 __global__
 void matmul(const float* A, const float* x, int n, int d, float* out) {
 	// A (d,n) @ x (n,) -> out (d,)
-	int j = blockIdx.x * blockDim.x + threadIdx.x;
-	int i = blockIdx.y;
-	if (i >= d || j >= n) return;
-	atomicAdd(&out[i], A[n * i + j] * x[j]);
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if(i >= d) return;
+	float sum = 0.0;
+	for(int j = 0; j < n; j++){
+		sum += A[n * i + j] * x[j];
+	} 
+	out[i] = sum;
 }
 
 __global__
 void matmul(const half* A, const float* x, int n, int d, float* out) {
-	// A (d,n) @ x (n,) -> out (d,)
-	int j = blockIdx.x * blockDim.x + threadIdx.x;
-	int i = blockIdx.y;
-	if (i >= d || j >= n) return;
-	atomicAdd(&out[i], __half2float(A[n * i + j]) * x[j]);
+		// A (d,n) @ x (n,) -> out (d,)
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if(i >= d) return;
+	float sum = 0.0;
+	for(int j = 0; j < n; j++){
+		sum += __half2float(A[n * i + j]) * x[j];
+	} 
+	out[i] = sum;
+}
+
+
+
+__device__
+inline float matmul_row(const float* row, const float* x, int offset, int dim) {
+  float sum = 0.0;
+  for (int j = offset; j < dim; j += 32) {
+    float v = row[j] * x[j];
+    sum += v;
+  }
+  return warp_reduce_sum(sum);
+}
+
+__device__
+inline float matmul_row(const half* row, const float* x, int offset, int dim) {
+	float sum = 0.0;
+	for (int j = offset; j < dim; j += 32) {
+		float v = __half2float(row[j]) * x[j];
+		sum += v;
+	}
+	return warp_reduce_sum(sum);
 }
 
 template <typename T>
-inline void dispatch_matmul(const T* A, const float* x, int n, int d, float* out) {
+__global__
+inline void matmul_full_utilization(const T* A, const float* x, int n, int d, float* out){
+	// A (d,n) @ x (n,) -> out (d,)
+	int i = blockIdx.x;
+	if (i >= d) return;
+	int offset = threadIdx.x;
+	float rowSum = matmul_row(&A[n * i], x, offset, n);
+	if (threadIdx.x == 0) {
+    	out[i] = rowSum;
+	}
+}
+
+template <typename T>
+__global__
+inline void fused_matmul_full_utilization(const T* A, const float* x, int n, int d, float* out){
+	// A (d,n) @ x (n,) -> out (d,)
+	int i = blockIdx.x;
+	if (i >= d) return;
+	int offset = threadIdx.x;
+	float rowSum = matmul_row(&A[n * i], x, offset, n);
+	if (threadIdx.x == 0) {
+    	out[i] += rowSum;
+	}
+}
+
+
+__device__ inline float blocktranspose(float v, float def) {
+  // Performs block-and-warp transpose operation:
+  //   For a block containing K warps where lane 0 contains val_k,
+  //   this function returns:
+  //   - For warp 0, lane K: val_k
+  //   - For all other warps and lanes: def
+  int lane = threadIdx.x % warpSize;
+  int warp = threadIdx.x / warpSize;
+  
+  // Will hold results of all warps.
+  // Each lane of the warp accumulates across 1 head element at a time.
+  // NOTE: Assumes warpSize is 32
+  __shared__ float sm[32];
+  if (lane == 0) sm[warp] = v;
+  __syncthreads();
+  
+  return lane < blockDim.x / warpSize ? sm[lane] : def;
+}
+
+template <typename T>
+__global__
+void matmul_wide(const T* A, const float* x, int n, int d, float* out) {
+  // A (d,n) @ x (n,) -> out (d,)
+  // PRECOND: Block is 1-D and contains WPB warps.
+  int i = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
+  if (i >= d) return;
+  // Warp j computes sum for row at <blockIdx.x*WPB + j>
+  // Lane 0 of each warp will hold result
+  int k = threadIdx.x % warpSize; //k = offset
+  float rowSum = matmul_row(&A[n * i], x, k, n);
+  // Transpose values so lane k in warp 0 contains row at <blockIdx.x*WPB + k>
+  // For WPB=32, this allows us to coalesce 32 float32 writes into a single 128-byte store
+  rowSum = blocktranspose(rowSum, 1.0);
+  if (threadIdx.x < blockDim.x / warpSize) {
+    int block_start_i = blockIdx.x * blockDim.x / warpSize;
+    out[block_start_i + k] = rowSum;
+  }
+}
+
+template <typename T>
+inline void dispatch_matmul(const T* A, const float* x, int n, int d, float* out) {// deli: n is embedding dimension, d is head dimension, kv_head_dim, or others. 
+	
+	/* pure naive
 	int BLOCK_SIZE = 32; // arbitrary
 	dim3 blocks;
 	blocks.x = (n + BLOCK_SIZE - 1)/BLOCK_SIZE;
@@ -198,6 +295,84 @@ inline void dispatch_matmul(const T* A, const float* x, int n, int d, float* out
 	tpb.x = BLOCK_SIZE;
 	tpb.y = 1;
 	matmul<<<blocks, tpb>>>(A, x, n, d, out);
+	*/
+
+	/*partial utilization
+	int MAX_THREADS_PER_BLOCK = 1024;
+	matmul<<<(n + MAX_THREADS_PER_BLOCK -1)/MAX_THREADS_PER_BLOCK, MAX_THREADS_PER_BLOCK>>>(A, x, n, d, out); 
+	*/
+
+	/*partial utilization2 naive matmul: thread per row
+	int MAX_THREADS_PER_BLOCK = 1024;
+	int BLOCK_SIZE = WARP_SIZE;
+	//needs to used "d" rather than "n", in case d > n (since the called function uses "d" as threshold) 
+	matmul_full_utilization<<<(d + MAX_THREADS_PER_BLOCK -1)/MAX_THREADS_PER_BLOCK, MAX_THREADS_PER_BLOCK>>>(A, x, n, d, out); 
+	*/
+	/*
+	int BLOCK_SIZE = WARP_SIZE;
+	matmul_full_utilization<<<d, BLOCK_SIZE>>>(A, x, n, d, out);
+	*/
+	int BLOCK_SIZE = WARP_SIZE;
+	matmul_wide<<<d, BLOCK_SIZE>>>(A, x, n, d, out);
+	
+	
+}
+
+template <typename T>
+inline void dispatch_fused_matmul(const T* A, const float* x, int n, int d, float* out) {// deli: n is embedding dimension, d is head dimension, kv_head_dim, or others. 
+	int BLOCK_SIZE = WARP_SIZE;
+	fused_matmul_full_utilization<<<d, BLOCK_SIZE>>>(A, x, n, d, out);
+}
+
+
+
+template <typename T>
+__global__
+void fused_qkv_matmul_clip(
+	const T* wq,      // (q_dim, dim)
+	const T* wk,      // (kv_dim, dim)
+	const T* wv,      // (kv_dim, dim)
+	const float* x,   // (dim,)
+	int dim,          // input dimension
+	int q_dim,        // n_heads * head_dim
+	int kv_dim,       // n_kv_heads * head_dim
+	float qkv_clip,   // clipping value
+	float* q_out,     // (q_dim,)
+	float* k_out,     // (kv_dim,)
+	float* v_out      // (kv_dim,)
+) {
+	// Each warp handles one row of either Q, K, or V output
+	int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
+	int total_rows = q_dim + 2 * kv_dim;
+	if (warp_id >= total_rows) return;
+	
+	// Determine which matrix (Q, K, or V) we're computing
+	const T* w;
+	float* out;
+	if (warp_id < q_dim) {
+		// Computing Q
+		w = wq + warp_id * dim;
+		out = q_out + warp_id;
+	} else if (warp_id < q_dim + kv_dim) {
+		// Computing K
+		w = wk + (warp_id - q_dim) * dim;
+		out = k_out + (warp_id - q_dim);
+	} else {
+		// Computing V
+		w = wv + (warp_id - q_dim - kv_dim) * dim;
+		out = v_out + (warp_id - q_dim - kv_dim);
+	}
+
+	// Compute matrix multiplication for this row
+	// Since block is 1-dimensional, thread ID is same as threadIdx.x,
+	// and warp partitions thread IDs
+	int offset = threadIdx.x % warpSize;
+	float row_sum = matmul_row(w, x, offset, dim);
+	// Write result with clipping
+	if (offset == 0) {
+		row_sum = row_sum < -qkv_clip ? -qkv_clip : (row_sum > qkv_clip ? qkv_clip : row_sum);
+		*out = row_sum;
+	}
 }
 
 __global__
@@ -259,6 +434,8 @@ void attn_softmax(
 	}
 }
 
+/*
+//naive att_mix
 __global__
 void att_mix(
 	const float* vb,  // (max_seq_len, n_kv_heads, head_dim) 
@@ -289,7 +466,7 @@ void att_mix(
 	sum = warp_reduce_sum(sum);
 	if (offset == 0) outh[i] = sum;
 }
-
+*/
 __global__
 void rmsnorm(const float* x, const float* weight, int size, float eps, float* out) {
 	// PRECOND: only one 1-D block is launched
@@ -324,6 +501,181 @@ void rope(
 	float v1 = x[i + 1];
 	out[i] = v0 * fcr - v1 * fci;
 	out[i + 1] = v0 * fci + v1 * fcr;
+}
+
+/*
+//better att_mix
+__global__
+void att_mix(
+  const float* vb,  // (max_seq_len, n_kv_heads, head_dim) 
+  const float* att, // (n_heads, kv_len)
+  int head_dim, 
+  int n_heads, 
+  int n_kv_heads,
+  int seq_len, 
+  int max_seq_len, 
+  float* out // (n_heads, head_dim)
+) {
+  // PRECOND: blocks are 2-D (warp_size, t_stride)
+  int h = blockIdx.x;
+  int group_size = n_heads / n_kv_heads;
+  int g = h / group_size;
+  int kv_stride = n_kv_heads * head_dim;
+  
+  const float* atth = att + max_seq_len * h;
+  const float* vh = vb + head_dim * g;
+  float* outh = out + head_dim * h;
+  
+  int warp_id = threadIdx.y;
+  int t_stride = blockDim.y;
+  
+  // Capacity 32 since there can be at most 32 warps in a block.
+  __shared__ float shared[32];
+  
+  for (int i = threadIdx.x; i < head_dim; i += warpSize) {
+    if (warp_id == 0) {
+      shared[threadIdx.x] = 0;
+    }
+    __syncthreads();
+    float sum = 0.0;
+    for (int t = warp_id; t < seq_len; t += t_stride) {
+      sum += vh[kv_stride * t + i] * atth[t];	
+    }
+    atomicAdd(&shared[threadIdx.x], sum);
+    __syncthreads();
+    if (warp_id == 0) {
+      outh[i] = shared[threadIdx.x];
+      shared[threadIdx.x] = 0;
+    }
+  }
+}
+*/
+
+__global__
+void att_mix(
+  const half* vb,  // (max_seq_len, n_kv_heads, head_dim) 
+  const float* att, // (n_heads, kv_len)
+  int head_dim, 
+  int n_heads, 
+  int n_kv_heads,
+  int seq_len, 
+  int max_seq_len, 
+  float* out // (n_heads, head_dim)
+) {
+  // PRECOND: blocks are 2-D (warp_size, t_stride)
+  int h = blockIdx.x;
+  int group_size = n_heads / n_kv_heads;
+  int g = h / group_size;
+  int kv_stride = n_kv_heads * head_dim;
+  
+  const float* atth = att + max_seq_len * h;
+  const half* vh = vb + head_dim * g;
+  float* outh = out + head_dim * h;
+  
+  int warp_id = threadIdx.y;
+  int t_stride = blockDim.y;
+  
+  // Each lane of the warp accumulates across 2 head elements at a time.
+  // NOTE: Assumes warpSize is 32
+  __shared__ float shared0[32]; // shared0[i] == chunk[2*i]
+  __shared__ float shared1[32]; // shared1[i] == chunk[2*i+1]
+  
+  for (int i = 2*threadIdx.x; i < head_dim; i += 2*warpSize) {
+    if (warp_id == 0) {
+      shared0[threadIdx.x] = 0;
+      shared1[threadIdx.x] = 0;
+    }
+    __syncthreads();
+    float2 sum01 = make_float2(0.0, 0.0);
+    constexpr int UNROLL = 16;
+    half2 v01_0; float att_0; 
+    half2 v01_1; float att_1; 
+    half2 v01_2; float att_2; 
+    half2 v01_3; float att_3;
+    half2 v01_4; float att_4;
+    half2 v01_5; float att_5;
+    half2 v01_6; float att_6;
+    half2 v01_7; float att_7;
+    half2 v01_8; float att_8; 
+    half2 v01_9; float att_9; 
+    half2 v01_10; float att_10; 
+    half2 v01_11; float att_11;
+    half2 v01_12; float att_12;
+    half2 v01_13; float att_13;
+    half2 v01_14; float att_14;
+    half2 v01_15; float att_15;
+    int t = warp_id;
+    for (int ctr = 0; ctr < seq_len / t_stride; t += t_stride, ctr++) {
+      int ctr_mod = ctr % UNROLL;
+      if (ctr_mod == 0) {
+        // prefetch every UNROLL iterations
+        #define PREFETCH(j) \
+          v01_##j = *((half2*)&vh[kv_stride * (t + j*t_stride) + i]); \
+          att_##j = atth[t + j*t_stride];
+        PREFETCH(0)
+        PREFETCH(1)
+        PREFETCH(2)
+        PREFETCH(3)
+        PREFETCH(4)
+        PREFETCH(5)
+        PREFETCH(6)
+        PREFETCH(7)
+        PREFETCH(8)
+        PREFETCH(9)
+        PREFETCH(10)
+        PREFETCH(11)
+        PREFETCH(12)
+        PREFETCH(13)
+        PREFETCH(14)
+        PREFETCH(15)
+        #undef PREFETCH
+      }
+      // pull one value out of prefetch batch
+      float2 v01;
+      float att_t;
+      switch (ctr_mod) {
+        #define CASE(j) \
+          case j: v01 = __half22float2(v01_##j); att_t = att_##j; break;
+        CASE(0)
+        CASE(1)
+        CASE(2)
+        CASE(3)
+        CASE(4)
+        CASE(5)
+        CASE(6)
+        CASE(7)
+        CASE(8)
+        CASE(9)
+        CASE(10)
+        CASE(11)
+        CASE(12)
+        CASE(13)
+        CASE(14)
+        CASE(15)
+        #undef CASE
+      }
+      // Sadly CUDA does not have float2 SIMD ops
+      sum01.x += v01.x * att_t;
+      sum01.y += v01.y * att_t;
+    }
+    for (; t < seq_len; t += t_stride) {
+      float2 v01 = __half22float2(*((half2*)&vh[kv_stride * t + i]));
+      float att_t = atth[t];
+      // Sadly CUDA does not have float2 SIMD ops
+      sum01.x += v01.x * att_t;
+      sum01.y += v01.y * att_t;
+    }
+    atomicAdd(&shared0[threadIdx.x], sum01.x);
+    atomicAdd(&shared1[threadIdx.x], sum01.y);
+    __syncthreads();
+    if (warp_id == 0) {
+      float even = shared0[threadIdx.x];
+      float odd = shared1[threadIdx.x];
+      *((float2*)&outh[i]) = make_float2(even, odd);
+      shared0[threadIdx.x] = 0;
+      shared1[threadIdx.x] = 0;
+    }
+  }
 }
 
 __global__
@@ -432,6 +784,8 @@ void Block::_block_cuda(
   dispatch_matmul<T>(wq<T>(), s.xb(), c.dim, q_dim, s.q());
   dispatch_matmul<T>(wk<T>(), s.xb(), c.dim, kv_dim, s.k());
   dispatch_matmul<T>(wv<T>(), s.xb(), c.dim, kv_dim, s.v());
+  int total_rows = q_dim + 2 * kv_dim;  // Total rows across Q, K, V
+
   
   // some models require clipping qkv values
   clip<<<
@@ -464,6 +818,8 @@ void Block::_block_cuda(
 	// key and value point to the kv cache
 	float* kb = key_cache();
 	float* vb = value_cache();
+	half* kb = (half*)key_cache();
+  	half* vb = (half*)value_cache();
 	copy_kv_entry<<<
 		(kv_dim + max_threads_per_block - 1)/max_threads_per_block, 
 		max_threads_per_block
@@ -492,6 +848,7 @@ void Block::_block_cuda(
 			s.att(), kv_len, c.max_seq_len, c.n_heads, s.att()
 		);
 	}
+	/*
   // multihead attention: mix values with attention scores
 	{
 		dim3 tpb;
@@ -505,8 +862,21 @@ void Block::_block_cuda(
 			kv_len, c.max_seq_len, s.xb2()
 		);
 	}
+	*/
+	{
+		dim3 tpb;
+		tpb.x = warp_size;
+		tpb.y = min(kv_len, max_threads_per_block / warp_size);
+		dim3 blocks;
+		blocks.x = c.n_heads;
+		att_mix<<<blocks, tpb>>>(
+		vb, s.att(),
+		c.head_dim, c.n_heads, c.n_kv_heads, 
+		kv_len, c.max_seq_len, s.xb2());
+	}
 	// final matmul projection via wo, using `hb` as temp storage
 	dispatch_matmul<T>(wo<T>(), s.xb2(), q_dim, c.dim, s.hb());
+	//dispatch_fused_matmul<T>(wo<T>(), s.xb2(), q_dim, c.dim, s.x());
 	
 	// attn residual back into x
 	add_residuals<<<
@@ -515,6 +885,7 @@ void Block::_block_cuda(
 	>>>(
 		s.x(), s.hb(), c.dim, s.x()
 	);
+	
 	
 	// ffn pre-norm
 	switch (c.norm_type) {
@@ -550,8 +921,8 @@ void Block::_block_cuda(
 		  break;
 	  }
   }
-  
-  dispatch_matmul<T>(w2<T>(), s.hb(), c.hidden_dim, c.dim, s.xb2());
+    //dispatch_fused_matmul<T>(w2<T>(), s.hb(), c.hidden_dim, c.dim, s.x());
+  	dispatch_matmul<T>(w2<T>(), s.hb(), c.hidden_dim, c.dim, s.xb2());
   
 	// ffn residual back into x
 	add_residuals<<<
@@ -560,6 +931,7 @@ void Block::_block_cuda(
 	>>>(
 		s.x(), s.xb2(), c.dim, s.x()
 	);
+	
 }
 
 void mha_cuda(

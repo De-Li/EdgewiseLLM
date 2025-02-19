@@ -6,6 +6,7 @@ build/
 *.sqlite
 *.nsys-rep
 *.ncu-rep
+*.yalm
 perf.data*
 *.gputrace/
 
