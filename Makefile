@@ -35,6 +35,8 @@ LDFLAGS=-lm
 CFLAGS+=-fopenmp -mf16c -mavx2 -mfma
 LDFLAGS+=-fopenmp
 LDFLAGS+=-lcudart
+LDFLAGS+=-lnvidia-ml
+
 
 ifneq (,$(wildcard /usr/local/cuda))
   LDFLAGS+=-L/usr/local/cuda/lib64

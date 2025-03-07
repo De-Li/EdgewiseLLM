@@ -185,6 +185,7 @@ template <typename T>
 void Block::_block_cpu(
   InferenceState& s,  // inference state
   int pos,            // index of the current token in the sequence
+  int kv_sink,
   int kv_pos,         // index of the current token in the kv cache, must be in [0..kv_len) since kv cache is a ring buffer
   int kv_len          // number of tokens in the kv cache that we will attend over
 ) const {
@@ -345,8 +346,8 @@ void ffn_cpu(
   delete[] hb2;
 }
 
-template void Block::_block_cpu<float>(InferenceState&, int, int, int) const;
-template void Block::_block_cpu<f16_t>(InferenceState&, int, int, int) const;
+template void Block::_block_cpu<float>(InferenceState&, int, int, int, int) const;
+template void Block::_block_cpu<f16_t>(InferenceState&, int, int, int, int) const;
 
 void Model::_copy_embedding(InferenceState& s, int token) {
   const Config& c = *config;
@@ -384,10 +385,10 @@ void Model::_forward_cpu(InferenceState& s, int token, int pos, InferenceMode mo
   // TODO: attention sinks
 	int kv_pos = pos % c.max_seq_len;
 	int kv_len = pos >= c.max_seq_len ? c.max_seq_len : pos + 1;
-
+  int fillingtemp = 0;
   // forward all layers in order
   for (auto b : blocks) {
-    b->block(s, pos, kv_pos, kv_len);
+    b->block(s, pos, fillingtemp, kv_pos, kv_len);
   }
 
   if (mode == InferenceMode::HYDRATE_KV_CACHE) {
