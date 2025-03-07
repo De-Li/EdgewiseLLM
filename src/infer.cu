@@ -8,7 +8,7 @@
 #include <stdlib.h>
 
 #define FULL_MASK 0xffffffff
-
+#define WARP_SIZE 32
 #define CUDA_CHECK(x)                                                                                    \
   do {                                                                                                 \
     cudaError_t err = x;                                                                             \
@@ -282,6 +282,44 @@ void fused_matmul_add_residuals(const T* A, const float* x, int n, int d, float*
   }
 }
 
+
+template <typename T>
+__global__
+inline void matmul_full_utilization(const T* A, const float* x, int n, int d, float* out){
+	// A (d,n) @ x (n,) -> out (d,)
+	int i = blockIdx.x;
+	if (i >= d) return;
+	int offset = threadIdx.x;
+	float rowSum = matmul_row(&A[n * i], x, offset, n);
+	if (threadIdx.x == 0) {
+    	out[i] = rowSum;
+	}
+}
+
+template <typename T>
+inline void dispatch_matmul(const T* A, const float* x, int n, int d, float* out) {// deli: n is embedding dimension, d is head dimension, kv_head_dim, or others. 
+
+	/*partial utilization
+	int MAX_THREADS_PER_BLOCK = 1024;
+	matmul<<<(n + MAX_THREADS_PER_BLOCK -1)/MAX_THREADS_PER_BLOCK, MAX_THREADS_PER_BLOCK>>>(A, x, n, d, out); 
+	*/
+
+	/*partial utilization2 naive matmul: thread per row
+	int MAX_THREADS_PER_BLOCK = 1024;
+	int BLOCK_SIZE = WARP_SIZE;
+	//needs to used "d" rather than "n", in case d > n (since the called function uses "d" as threshold) 
+	matmul_full_utilization<<<(d + MAX_THREADS_PER_BLOCK -1)/MAX_THREADS_PER_BLOCK, MAX_THREADS_PER_BLOCK>>>(A, x, n, d, out); 
+	*/
+	/*
+	int BLOCK_SIZE = WARP_SIZE;
+	matmul_full_utilization<<<d, BLOCK_SIZE>>>(A, x, n, d, out);
+	*/
+	int BLOCK_SIZE = WARP_SIZE;
+	matmul_wide<<<d, BLOCK_SIZE>>>(A, x, n, d, out);
+	
+	
+}
+
 template <typename T>
 __global__
 void fused_qkv_matmul_clip(
@@ -389,7 +427,7 @@ void attn_softmax(
     outh[t] /= score_sum;
   }
 }
-
+/**/
 __global__
 void att_mix(
   const half* vb,  // (max_seq_len, n_kv_heads, head_dim) 
@@ -517,6 +555,84 @@ void att_mix(
   }
 }
 
+/*
+__global__
+void att_mix(
+  const half* vb, // (max_seq_len, n_kv_heads, head_dim) 
+  const float* att, // (n_heads, kv_len)
+  int head_dim, 
+  int n_heads, 
+  int n_kv_heads,
+  int seq_len, 
+  int max_seq_len, 
+  float* out // (n_heads, head_dim)
+) {
+  // PRECOND: blocks are 1-D and blockDim.x == WARP_SIZE
+  int h = blockIdx.x;
+  int group_size = n_heads / n_kv_heads;
+  int g = h / group_size;
+  int i = blockIdx.y;
+  int offset = threadIdx.x;
+  int kv_stride = n_kv_heads * head_dim;
+  
+  const float* atth = att + max_seq_len * h;
+  const half* vh = vb + head_dim * g;
+  float* outh = out + head_dim * h;
+  
+  float sum = 0.0;
+  for (int t = offset; t < seq_len; t += WARP_SIZE) {
+    sum += __half2float(vh[kv_stride * t + i]) * atth[t];
+  }
+  sum = warp_reduce_sum(sum);
+  if (offset == 0) outh[i] = sum;
+}
+
+
+__global__
+void att_mix(
+  const half* vb,  // (max_seq_len, n_kv_heads, head_dim) 
+  const float* att, // (n_heads, kv_len)
+  int head_dim, 
+  int n_heads, 
+  int n_kv_heads,
+  int seq_len, 
+  int max_seq_len, 
+  float* out // (n_heads, head_dim)
+) {
+  // PRECOND: blocks are 2-D (warp_size, t_stride)
+  int h = blockIdx.x;
+  int group_size = n_heads / n_kv_heads;
+  int g = h / group_size;
+  int kv_stride = n_kv_heads * head_dim;
+  
+  const float* atth = att + max_seq_len * h;
+  const half* vh = vb + head_dim * g;
+  float* outh = out + head_dim * h;
+  
+  int warp_id = threadIdx.y;
+  int t_stride = blockDim.y;
+  
+  // Capacity 32 since there can be at most 32 warps in a block.
+  __shared__ float shared[32];
+  
+  for (int i = threadIdx.x; i < head_dim; i += warpSize) {
+    if (warp_id == 0) {
+      shared[threadIdx.x] = 0;
+    }
+    __syncthreads();
+    float sum = 0.0;
+    for (int t = warp_id; t < seq_len; t += t_stride) {
+      sum += __half2float(vh[kv_stride * t + i]) * atth[t];	
+    }
+    atomicAdd(&shared[threadIdx.x], sum);
+    __syncthreads();
+    if (warp_id == 0) {
+      outh[i] = shared[threadIdx.x];
+      shared[threadIdx.x] = 0;
+    }
+  }
+}
+*/
 __global__
 void rmsnorm(const float* x, const float* weight, int size, float eps, float* out) {
   // PRECOND: only one 1-D block is launched
@@ -591,6 +707,29 @@ inline void rope(
     );
     *((half2*)&out[pair_idx]) = result;
   }
+}
+
+__global__
+void copy_kv_entry(
+	const half* in, int kv_pos, int kv_dim, half* kb
+) {
+	// PRECOND: grid and blocks are 1-D
+	int i = blockDim.x * blockIdx.x + threadIdx.x;
+	if (i >= kv_dim) return;
+	
+	kb[kv_pos * kv_dim + i] = in[i];
+}
+
+//original clip
+__global__
+void clip(
+	const float* x, float v, int d, float* out
+) {
+	// PRECOND: grid and blocks are 1-D
+	int i = blockDim.x * blockIdx.x + threadIdx.x;
+	if (i >= d) return;
+	
+	out[i] = x[i] < -v ? -v : (x[i] > v ? v : x[i]);
 }
 
 template <ActivationType A> __device__ inline float act(float x);
@@ -721,6 +860,7 @@ void rotate_sink_tokens(
   }
 }
 
+
 template <typename T>
 void Block::_block_cuda(
   InferenceState& s, int pos, int kv_sink, int kv_pos, int kv_len
@@ -740,9 +880,11 @@ void Block::_block_cuda(
   int q_dim = c.n_heads * c.head_dim;
   int kv_dim = c.n_kv_heads * c.head_dim;
 
-  {
-    // qkv matmuls for this position
+  
+    // fused qkv matmuls for this position
     // some models require clipping qkv values
+   {
+    
     int total_rows = q_dim + 2 * kv_dim;  // Total rows across Q, K, V
     fused_qkv_matmul_clip<<<total_rows, warp_size>>>(
       wq<T>(),
@@ -758,12 +900,14 @@ void Block::_block_cuda(
       s.v()
     );
   }
-  
+
   // Update Q, K with RoPE relative positional encoding: 
   // complex-valued rotate q and k in each head
   // Also copy K, V to KV cache
   half* kb = (half*)key_cache();
   half* vb = (half*)value_cache();
+	
+  //fused rope
   {
     // Calculate number of thread blocks needed
     // We need enough threads to handle the largest of:
@@ -789,6 +933,8 @@ void Block::_block_cuda(
       vb
     );
   }
+  
+  
   if (kv_sink > 0) {
     // Sink tokens remain untouched while the rest of the KV cache is incrementally 
     // replaced in ring order, but sink i must always be positioned (max_seq_len - i)
@@ -800,6 +946,7 @@ void Block::_block_cuda(
       kb, kv_sink, kv_dim, c.head_dim, c.rope_theta, c.rotary_dim
     );
   }
+  
   
   // multihead attention: dot products and softmax
   {
@@ -818,6 +965,7 @@ void Block::_block_cuda(
   }
   // multihead attention: mix values with attention scores
   {
+        /* usage */
     dim3 tpb;
     tpb.x = warp_size;
     tpb.y = min(kv_len, max_threads_per_block / warp_size);

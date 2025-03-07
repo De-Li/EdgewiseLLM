@@ -1,0 +1,33 @@
+```
+// Function to add two vectors
+void addVectors(vector<double> &a, vector<double> &b, vector<double> &c) {
+    c.clear();
+    c.reserve(a.size() + b.size());
+    for (int I = 0; I < a.size(); i++) {
+        c.push_back(a[i] + b[i]);
+    }
+}
+```
+
+Explanation:
+
+- The function takes three vectors `a`, `b`, and `c` as input.
+- It initializes a new vector `c` with the same size as `a` and `b`.
+- It iterates through each element of `a` and adds it to the end of `c`.
+- It iterates through each element of `b` and adds it to the end of `c`.
+- It resizes `c` to the same size as `a` and `b`.
+- It returns `c`.
+
+Example usage:
+
+```
+vector<double> a = {1, 2, 3};
+vector<double> b = {4, 5, 6};
+vector<double> c = addVectors(a, b, c);
+```
+
+Output:
+
+```
+[5, 7, 9]
+```</s>

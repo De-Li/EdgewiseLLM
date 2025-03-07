@@ -35,16 +35,19 @@ LDFLAGS=-lm
 CFLAGS+=-fopenmp -mf16c -mavx2 -mfma
 LDFLAGS+=-fopenmp
 LDFLAGS+=-lcudart
+LDFLAGS+=-lnvidia-ml
+
 
 ifneq (,$(wildcard /usr/local/cuda))
   LDFLAGS+=-L/usr/local/cuda/lib64
+  CFLAGS+=-I/usr/local/cuda/include
 endif
 
 CUFLAGS+=-O2 -lineinfo -Ivendor
 CUFLAGS+=-allow-unsupported-compiler # for recent CUDA versions
 
 ifeq ($(CUARCH),)
-  CUFLAGS+=-gencode arch=compute_80,code=sm_80 -gencode arch=compute_90,code=sm_90 --threads 2
+  CUFLAGS+=-gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80 -gencode arch=compute_90,code=sm_90 --threads 2
 else
   CUFLAGS+=-arch=$(CUARCH)
 endif

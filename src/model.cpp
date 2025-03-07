@@ -11,6 +11,8 @@
 
 #include "immintrin.h"
 
+#include <cmath>
+
 using json = nlohmann::json;
 
 void Config::from_yalm(YALMData& yalm, int context) {
@@ -24,6 +26,8 @@ void Config::from_yalm(YALMData& yalm, int context) {
 
   // for now limit seq_len to 4096 to avoid KV cache OOM for models like Mistral since window size isn't correctly specified
   max_seq_len = std::min(std::stoi(yalm.metadata.at("max_seq_len").get<std::string>()), 4096);
+  max_seq_len = 16;
+  std::cout << "max_seq_len: " << max_seq_len << std::endl;
   if (context) {
     max_seq_len = context;
   }
@@ -385,7 +389,26 @@ void Model::forward(InferenceState& s, int token, int pos, InferenceMode mode) {
     _forward_cpu(s, token, pos, mode);
   }
 }
+/*
+float Model::get_perplexity(InferenceState s){
+   if (s.logits() == nullptr) {
+        std::cerr << "Error: logProbs is empty.\n";
+        return std::numeric_limits<double>::infinity();
+    }
 
+    float sumLogProb = 0.0;
+    const float* logits = s.logits();
+    for(logit:s.logits()){
+      sumLogProb += logit;
+    }
+
+    // average log probability
+    float avgLogProb = sumLogProb / s.size();
+
+    // perplexity = exp(-average_log_probability)
+    return std::exp(-avgLogProb);
+}
+*/
 #if DEBUG_MODEL
 DebugTensor::DebugTensor(const std::vector<float>& data) {
   data_f32 = data;

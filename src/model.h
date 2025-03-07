@@ -31,6 +31,17 @@ extern "C" void free_cuda(void* device);
 extern "C" void unregister_cuda_host(void* host);
 extern "C" void set_cuda_device(int device);
 
+//deli: for experiment
+struct Stats {
+    size_t tokens;
+    double throughput;
+    double latency;
+    double hydrate;
+    double bandwidth;
+    double total;
+    double avg_power;
+};
+
 struct Config {
   int dim;                  // transformer input & output dimension
   int hidden_dim;           // dimension of hidden layer in feedforward network
@@ -222,6 +233,9 @@ struct Model {
   
   void forward(InferenceState& s, int token, int pos, InferenceMode mode = InferenceMode::OUTPUT_LOGITS);
   void cuda();
+
+  //deli:
+  float get_perplexity(InferenceState s);
 
 private:
   void _forward_cpu(InferenceState& s, int token, int pos, InferenceMode mode);
