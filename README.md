@@ -14,28 +14,28 @@ The code and inspiration are based on [yalm](https://github.com/andrewkchan/yalm
 # Methodology
 EdgeWiseLLM tackles the challenge of deploying resource-intensive LLMs on edge devices through two synergistic modules: CUDA kernel-level optimization and a dynamic decision-making framework. Below is a deeper dive:
 
-##1. Kernel-Level CUDA Optimization
+## 1. Kernel-Level CUDA Optimization
 EdgeWiseLLM implements several CUDA-level strategies to improve token-level inference performance:
 
-###Thread Block Reorganization:
+### Thread Block Reorganization:
 Inference workloads were profiled to identify underutilization in thread execution. Thread blocks were restructured to match the compute/memory access ratio and ensure full warp occupancy.
 
-###Memory Coalescing & Shared Memory:
+### Memory Coalescing & Shared Memory:
 Data structures were re-aligned to enable coalesced global memory access. Frequently accessed tensors (e.g., attention scores and value matrices) were moved into shared memory, significantly reducing latency.
 
-###Sliding Window Attention:
+### Sliding Window Attention:
 Inspired by Longformer and GPT optimizations, a sliding window kernel was implemented to truncate the attention window size, limiting quadratic complexity in long sequence inference.
 
-###Quantization Support:
+### Quantization Support:
 FP16 and FP32 quantized weights were used with appropriate dequantization strategies at runtime, striking a trade-off between precision and speed.
 
-###KV-Cache Sink Optimization:
+### KV-Cache Sink Optimization:
 A specialized “KV sink” check was implemented to reuse cached key/value tensors across decoding steps, minimizing data re-fetch and redundant compute.
 
-##2. Configurable Inference Decision-Making
+## 2. Configurable Inference Decision-Making
 Given the broad design space of kernel configurations and hardware characteristics, EdgeWiseLLM introduces a configuration selector:
 
-###Multi-Objective Scoring Function:
+### Multi-Objective Scoring Function:
 Each configuration is evaluated using a scoring metric that considers:
 
 Inference throughput (tokens/sec), Latency (token generation time), memory throughput(GB/S), Power consumption (measured using nvml),  and Model perplexity on validation samples.
@@ -66,6 +66,6 @@ EdgeWiseLLM empowers developers and researchers to bring cutting-edge LLM capabi
 
 🔗 Related Links
 [GUI Demo](https://youtu.be/SVmaBCRmV_I)
-# 📊 Results
+📊 Results
 [Paper](https://drive.google.com/file/d/1xcePLMSPCUD_SqZWu6xA6HGy0d6cT19O/view?usp=sharing)
 
