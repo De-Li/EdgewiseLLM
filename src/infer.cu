@@ -555,7 +555,7 @@ void att_mix(
   }
 }
 */
-//naive
+
 __global__
 void att_mix(
   const half* vb, // (max_seq_len, n_kv_heads, head_dim) 
@@ -587,41 +587,6 @@ void att_mix(
   if (offset == 0) outh[i] = sum;
 }
 
-/*
-//better att_mix
-__global__
-void att_mix(
-  const half* vb,  // (max_seq_len, n_kv_heads, head_dim) 
-  const float* att, // (n_heads, kv_len)
-  int head_dim, 
-  int n_heads, 
-  int n_kv_heads,
-  int seq_len, 
-  int max_seq_len, 
-  float* out // (n_heads, head_dim)
-) {
-  // PRECOND: blocks are 1-D and `out` has been zeroed
-  int h = blockIdx.x;
-  int group_size = n_heads / n_kv_heads;
-  int g = h / group_size;
-  int kv_stride = n_kv_heads * head_dim;
-  
-  const float* atth = att + max_seq_len * h;
-  const half* vh = vb + head_dim * g;
-  float* outh = out + head_dim * h;
-  
-  int t_per_thread = seq_len / gridDim.y;
-  int t_start = blockIdx.y * t_per_thread;
-  
-  for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-    float sum = 0.0;
-    for (int t = t_start; t < t_start + t_per_thread; t++) {
-      sum += __half2float(vh[kv_stride * t + i]) * atth[t];	
-    }
-    atomicAdd(&outh[i], sum);
-  }
-}
-*/
 __global__
 void rmsnorm(const float* x, const float* weight, int size, float eps, float* out) {
   // PRECOND: only one 1-D block is launched
@@ -676,17 +641,6 @@ inline void rope(
     );
     *((half2*)&out[pair_idx]) = result;
   }
-}
-
-__global__
-void add_residuals(
-	const float* x, const float* y, int d, float* out
-) {
-	// PRECOND: grid and blocks are 1-D
-	int i = blockDim.x * blockIdx.x + threadIdx.x;
-	if (i >= d) return;
-	
-	out[i] = x[i] + y[i];
 }
 
 __device__
@@ -765,31 +719,6 @@ void fused_ffn_w1_w3_glu_act(
   if (offset == 0) {
     out[warp_id] = act<A>(sum1) * sum3;
   }
-}
-
-__global__
-void glu_silu(
-	const float* x, const float* weight, int d, float* out
-) {
-	// PRECOND: grid and blocks are 1-D
-	int i = blockDim.x * blockIdx.x + threadIdx.x;
-	if (i >= d) return;
-	
-	out[i] = weight[i] * x[i] / (1.0f + expf(-x[i]));
-}
-
-__global__
-void glu_gelu(
-	const float* x, const float* weight, int d, float* out
-) {
-	// PRECOND: grid and blocks are 1-D
-	int i = blockDim.x * blockIdx.x + threadIdx.x;
-	if (i >= d) return;
-	
-	float v = x[i];
-	out[i] =
-		weight[i] * 
-		0.5f * v * (1.0f + tanhf(0.797885f * (v + 0.044715f * v * v * v)));
 }
 
 __global__
@@ -905,8 +834,8 @@ void Block::_block_cuda(
   int q_dim = c.n_heads * c.head_dim;
   int kv_dim = c.n_kv_heads * c.head_dim;
 
-  /*
-    / fused qkv matmuls for this position
+  
+    // fused qkv matmuls for this position
     // some models require clipping qkv values
    {
     
@@ -925,25 +854,6 @@ void Block::_block_cuda(
       s.v()
     );
   }
-  */
-    // qkv matmuls for this position
-  dispatch_matmul<T>(wq<T>(), s.xb(), c.dim, q_dim, s.q());
-  dispatch_matmul<T>(wk<T>(), s.xb(), c.dim, kv_dim, s.k());
-  dispatch_matmul<T>(wv<T>(), s.xb(), c.dim, kv_dim, s.v());
-
-    // some models require clipping qkv values
-  clip<<<
-	  (q_dim + max_threads_per_block - 1)/max_threads_per_block, 
-	  max_threads_per_block
-  >>>(s.q(), c.qkv_clip, q_dim, s.q());
-  clip<<<
-	  (kv_dim + max_threads_per_block - 1)/max_threads_per_block, 
-	  max_threads_per_block
-  >>>(s.k(), c.qkv_clip, kv_dim, s.k());
-  clip<<<
-	  (kv_dim + max_threads_per_block - 1)/max_threads_per_block,
-	  max_threads_per_block
-  >>>(s.v(), c.qkv_clip, kv_dim, s.v());
 
   // Update Q, K with RoPE relative positional encoding: 
   // complex-valued rotate q and k in each head
@@ -1010,7 +920,6 @@ void Block::_block_cuda(
   // multihead attention: mix values with attention scores
   {
         /* usage */
-    /* usage */
     dim3 tpb;
     tpb.x = WARP_SIZE;
     dim3 blocks;
@@ -1025,21 +934,9 @@ void Block::_block_cuda(
 
   // final matmul projection and residual back:
   // x <- wo(...) + x
-  /*
   fused_matmul_add_residuals<<<c.dim/32, warp_size*32>>>(
     wo<T>(), s.xb2(), q_dim, c.dim, s.x()
   );
-  */
-  	dispatch_matmul<T>(wo<T>(), s.xb2(), q_dim, c.dim, s.hb());
-	//dispatch_fused_matmul<T>(wo<T>(), s.xb2(), q_dim, c.dim, s.x());
-	
-	// attn residual back into x
-	add_residuals<<<
-		(c.dim + max_threads_per_block - 1)/max_threads_per_block, 
-		max_threads_per_block
-	>>>(
-		s.x(), s.hb(), c.dim, s.x()
-	);
   
   // ffn pre-norm
   switch (c.norm_type) {
@@ -1053,45 +950,29 @@ void Block::_block_cuda(
   
   // mix self.w2(F.silu(self.w1(x)) * self.w3(x))
   // Note this is a feedforward with a GLU, not a simple MLP.
-  dispatch_matmul<T>(w1<T>(), s.xb(), c.dim, c.hidden_dim, s.hb());
-  dispatch_matmul<T>(w3<T>(), s.xb(), c.dim, c.hidden_dim, s.hb2());
   switch (c.act) {
-	  case ActivationType::GELU: {
-		  glu_gelu<<<
-			  (c.hidden_dim + max_threads_per_block - 1)/max_threads_per_block, 
-			  max_threads_per_block
-		  >>>(
-				s.hb(), s.hb2(), c.hidden_dim, s.hb()
-			);
-		  break;
-	  }
-	  case ActivationType::SILU: {
-		  glu_silu<<<
-			  (c.hidden_dim + max_threads_per_block - 1)/max_threads_per_block, 
-			  max_threads_per_block
-		  >>>(
-				s.hb(), s.hb2(), c.hidden_dim, s.hb()
-			);
-		  break;
-	  }
+    case ActivationType::GELU: {
+      fused_ffn_w1_w3_glu_act<T, ActivationType::GELU><<<
+        c.hidden_dim, warp_size
+      >>>(
+        w1<T>(), w3<T>(), s.xb(), c.dim, c.hidden_dim, s.hb()
+      );
+      break;
+    }
+    case ActivationType::SILU: {
+      fused_ffn_w1_w3_glu_act<T, ActivationType::SILU><<<
+        c.hidden_dim, warp_size
+      >>>(
+        w1<T>(), w3<T>(), s.xb(), c.dim, c.hidden_dim, s.hb()
+      );
+      break;
+    }
   }
   
   // add residual back: x <- w2(...) + x
-  /*
   fused_matmul_add_residuals<<<c.dim/32, warp_size*32>>>(
     w2<T>(), s.hb(), c.hidden_dim, c.dim, s.x()
   );
-  */
-  dispatch_matmul<T>(w2<T>(), s.hb(), c.hidden_dim, c.dim, s.xb2());
-  
-	// ffn residual back into x
-	add_residuals<<<
-		(c.dim + max_threads_per_block - 1)/max_threads_per_block,
-		max_threads_per_block
-	>>>(
-		s.x(), s.xb2(), c.dim, s.x()
-	);
-
 }
 
 void mha_cuda(
