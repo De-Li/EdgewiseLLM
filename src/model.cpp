@@ -26,6 +26,8 @@ void Config::from_yalm(YALMData& yalm, int context) {
 
   // for now limit seq_len to 4096 to avoid KV cache OOM for models like Mistral since window size isn't correctly specified
   max_seq_len = std::min(std::stoi(yalm.metadata.at("max_seq_len").get<std::string>()), 4096);
+  max_seq_len = 256;
+  std::cout << "max_seq_len: " << max_seq_len << std::endl;
   if (context) {
     max_seq_len = context;
   }

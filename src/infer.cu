@@ -934,7 +934,7 @@ void Block::_block_cuda(
     );
   }
   
-  /*
+  
   if (kv_sink > 0) {
     // Sink tokens remain untouched while the rest of the KV cache is incrementally 
     // replaced in ring order, but sink i must always be positioned (max_seq_len - i)
@@ -946,7 +946,7 @@ void Block::_block_cuda(
       kb, kv_sink, kv_dim, c.head_dim, c.rope_theta, c.rotary_dim
     );
   }
-  */
+  
   
   // multihead attention: dot products and softmax
   {
