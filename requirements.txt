@@ -1,4 +1,0 @@
-# convert.py
-safetensors
-torch
-numpy
