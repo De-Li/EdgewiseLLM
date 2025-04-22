@@ -463,7 +463,7 @@ int main(int argc, char* argv[]) {
   std::string prompt_path = "";        // prompt file path
   int context = 0;
   // Completion mode options
-  int num_steps = 4096;                 // number of steps to run for
+  int num_steps = 4096;                  // number of steps to run for
   // Passkey mode options
   int n_junk = 250;                   // number of junk lines to insert
   int passkey_pos = -1;                 // passkey position (-1 - random)

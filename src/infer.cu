@@ -315,7 +315,7 @@ inline void dispatch_matmul(const T* A, const float* x, int n, int d, float* out
 	matmul_full_utilization<<<d, BLOCK_SIZE>>>(A, x, n, d, out);
 	*/
 	int BLOCK_SIZE = WARP_SIZE;
-	matmul_full_utilization<<<d, BLOCK_SIZE>>>(A, x, n, d, out);
+	matmul_wide<<<d, BLOCK_SIZE>>>(A, x, n, d, out);
 	
 	
 }
@@ -427,7 +427,7 @@ void attn_softmax(
     outh[t] /= score_sum;
   }
 }
-/*
+/**/
 __global__
 void att_mix(
   const half* vb,  // (max_seq_len, n_kv_heads, head_dim) 
@@ -555,7 +555,7 @@ void att_mix(
   }
 }
 
-//naive
+/*
 __global__
 void att_mix(
   const half* vb, // (max_seq_len, n_kv_heads, head_dim) 
@@ -586,9 +586,7 @@ void att_mix(
   sum = warp_reduce_sum(sum);
   if (offset == 0) outh[i] = sum;
 }
-*/
 
-//better att_mix
 
 __global__
 void att_mix(
@@ -634,7 +632,7 @@ void att_mix(
     }
   }
 }
-
+*/
 __global__
 void rmsnorm(const float* x, const float* weight, int size, float eps, float* out) {
   // PRECOND: only one 1-D block is launched
@@ -728,7 +726,6 @@ void clip(
 	const float* x, float v, int d, float* out
 ) {
 	// PRECOND: grid and blocks are 1-D
-  
 	int i = blockDim.x * blockIdx.x + threadIdx.x;
 	if (i >= d) return;
 	
@@ -902,27 +899,8 @@ void Block::_block_cuda(
       s.k(),
       s.v()
     );
-   }
-  /*
-    // qkv matmuls for this position
-  dispatch_matmul<T>(wq<T>(), s.xb(), c.dim, q_dim, s.q());
-  dispatch_matmul<T>(wk<T>(), s.xb(), c.dim, kv_dim, s.k());
-  dispatch_matmul<T>(wv<T>(), s.xb(), c.dim, kv_dim, s.v());
+  }
 
-    // some models require clipping qkv values
-  clip<<<
-	  (q_dim + max_threads_per_block - 1)/max_threads_per_block, 
-	  max_threads_per_block
-  >>>(s.q(), c.qkv_clip, q_dim, s.q());
-  clip<<<
-	  (kv_dim + max_threads_per_block - 1)/max_threads_per_block, 
-	  max_threads_per_block
-  >>>(s.k(), c.qkv_clip, kv_dim, s.k());
-  clip<<<
-	  (kv_dim + max_threads_per_block - 1)/max_threads_per_block,
-	  max_threads_per_block
-  >>>(s.v(), c.qkv_clip, kv_dim, s.v());
-*/
   // Update Q, K with RoPE relative positional encoding: 
   // complex-valued rotate q and k in each head
   // Also copy K, V to KV cache
