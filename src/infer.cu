@@ -315,7 +315,7 @@ inline void dispatch_matmul(const T* A, const float* x, int n, int d, float* out
 	matmul_full_utilization<<<d, BLOCK_SIZE>>>(A, x, n, d, out);
 	*/
 	int BLOCK_SIZE = WARP_SIZE;
-	matmul_wide<<<d, BLOCK_SIZE>>>(A, x, n, d, out);
+	matmul_full_utilization<<<d, BLOCK_SIZE>>>(A, x, n, d, out);
 	
 	
 }
@@ -554,8 +554,8 @@ void att_mix(
     }
   }
 }
-*/
 
+//naive
 __global__
 void att_mix(
   const half* vb, // (max_seq_len, n_kv_heads, head_dim) 
@@ -585,6 +585,54 @@ void att_mix(
   }
   sum = warp_reduce_sum(sum);
   if (offset == 0) outh[i] = sum;
+}
+*/
+
+//better att_mix
+
+__global__
+void att_mix(
+  const half* vb,  // (max_seq_len, n_kv_heads, head_dim) 
+  const float* att, // (n_heads, kv_len)
+  int head_dim, 
+  int n_heads, 
+  int n_kv_heads,
+  int seq_len, 
+  int max_seq_len, 
+  float* out // (n_heads, head_dim)
+) {
+  // PRECOND: blocks are 2-D (warp_size, t_stride)
+  int h = blockIdx.x;
+  int group_size = n_heads / n_kv_heads;
+  int g = h / group_size;
+  int kv_stride = n_kv_heads * head_dim;
+  
+  const float* atth = att + max_seq_len * h;
+  const half* vh = vb + head_dim * g;
+  float* outh = out + head_dim * h;
+  
+  int warp_id = threadIdx.y;
+  int t_stride = blockDim.y;
+  
+  // Capacity 32 since there can be at most 32 warps in a block.
+  __shared__ float shared[32];
+  
+  for (int i = threadIdx.x; i < head_dim; i += warpSize) {
+    if (warp_id == 0) {
+      shared[threadIdx.x] = 0;
+    }
+    __syncthreads();
+    float sum = 0.0;
+    for (int t = warp_id; t < seq_len; t += t_stride) {
+      sum += __half2float(vh[kv_stride * t + i]) * atth[t];	
+    }
+    atomicAdd(&shared[threadIdx.x], sum);
+    __syncthreads();
+    if (warp_id == 0) {
+      outh[i] = shared[threadIdx.x];
+      shared[threadIdx.x] = 0;
+    }
+  }
 }
 
 __global__
@@ -680,6 +728,7 @@ void clip(
 	const float* x, float v, int d, float* out
 ) {
 	// PRECOND: grid and blocks are 1-D
+  
 	int i = blockDim.x * blockIdx.x + threadIdx.x;
 	if (i >= d) return;
 	
@@ -853,8 +902,27 @@ void Block::_block_cuda(
       s.k(),
       s.v()
     );
-  }
+   }
+  /*
+    // qkv matmuls for this position
+  dispatch_matmul<T>(wq<T>(), s.xb(), c.dim, q_dim, s.q());
+  dispatch_matmul<T>(wk<T>(), s.xb(), c.dim, kv_dim, s.k());
+  dispatch_matmul<T>(wv<T>(), s.xb(), c.dim, kv_dim, s.v());
 
+    // some models require clipping qkv values
+  clip<<<
+	  (q_dim + max_threads_per_block - 1)/max_threads_per_block, 
+	  max_threads_per_block
+  >>>(s.q(), c.qkv_clip, q_dim, s.q());
+  clip<<<
+	  (kv_dim + max_threads_per_block - 1)/max_threads_per_block, 
+	  max_threads_per_block
+  >>>(s.k(), c.qkv_clip, kv_dim, s.k());
+  clip<<<
+	  (kv_dim + max_threads_per_block - 1)/max_threads_per_block,
+	  max_threads_per_block
+  >>>(s.v(), c.qkv_clip, kv_dim, s.v());
+*/
   // Update Q, K with RoPE relative positional encoding: 
   // complex-valued rotate q and k in each head
   // Also copy K, V to KV cache
@@ -921,12 +989,12 @@ void Block::_block_cuda(
   {
         /* usage */
     dim3 tpb;
-    tpb.x = WARP_SIZE;
+    tpb.x = warp_size;
+    tpb.y = min(kv_len, max_threads_per_block / warp_size);
     dim3 blocks;
     blocks.x = c.n_heads;
-    blocks.y = c.head_dim;
     att_mix<<<blocks, tpb>>>(
-      vb, s.att(), 
+      vb, s.att(),
       c.head_dim, c.n_heads, c.n_kv_heads, 
       kv_len, c.max_seq_len, s.xb2()
     );
