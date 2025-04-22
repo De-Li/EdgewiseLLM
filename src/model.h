@@ -6,6 +6,8 @@
 #include <vector>
 #include <map>
 
+#define DEBUG_MODEL 0
+
 constexpr int KV_SINKS = 2;
 
 enum class ActivationType {
@@ -118,6 +120,7 @@ private:
 /* Transformer Block */
 struct Block {
   Block(
+    int layer_i,
     const std::shared_ptr<Config> config,
     const Tensor* rms_att_weight,
     const Tensor* rms_ffn_weight,
@@ -147,8 +150,8 @@ struct Block {
   T* w2() const { return static_cast<T*>(_w2); }
   template <typename T>
   T* w3() const { return static_cast<T*>(_w3); }
-  float* key_cache() const { return _key_cache; }
-  float* value_cache() const { return _value_cache; }
+  f16_t* key_cache() const { return _key_cache; }
+  f16_t* value_cache() const { return _value_cache; }
 
   // Compute forward pass for this block and update the inference state accordingly.
   // PRECONDITIONS: 
@@ -169,8 +172,8 @@ private:
   void _block_cpu(
     InferenceState& s,  // inference state
     int pos,            // index of the current token in the sequence
-    int kv_pos,         // index of the current token in the kv cache, must be in [0..kv_len) since kv cache is a ring buffer
     int kv_sink,        // number of sink tokens currently in the KV cache
+    int kv_pos,         // index of the current token in the kv cache, must be in [0..kv_len) since kv cache is a ring buffer
     int kv_len          // number of tokens in the kv cache that we will attend over
   ) const;
   template <typename T>
@@ -182,27 +185,31 @@ private:
     int kv_len          // number of tokens in the kv cache that we will attend over
   ) const;
 
+#if DEBUG_MODEL
+  int _layer_i = 0;
+#endif
+
   std::shared_ptr<Config> _config;
   Device _device = Device::CPU;
 
   // weights for norms
-	float* _rms_att_weight = nullptr; // (dim) rmsnorm weights
-	float* _rms_ffn_weight = nullptr; // (dim)
+  float* _rms_att_weight = nullptr; // (dim) rmsnorm weights
+  float* _rms_ffn_weight = nullptr; // (dim)
 
   // weights for self-attention matmuls
-	void* _wq = nullptr; // (n_heads * head_dim, dim)
-	void* _wk = nullptr; // (n_kv_heads * head_dim, dim)
-	void* _wv = nullptr; // (n_kv_heads * head_dim, dim)
-	void* _wo = nullptr; // (dim, n_heads * head_dim)
-	
+  void* _wq = nullptr; // (n_heads * head_dim, dim)
+  void* _wk = nullptr; // (n_kv_heads * head_dim, dim)
+  void* _wv = nullptr; // (n_kv_heads * head_dim, dim)
+  void* _wo = nullptr; // (dim, n_heads * head_dim)
+  
   // weights for ffn
-	void* _w1 = nullptr; // (n_experts?, hidden_dim, dim)
-	void* _w2 = nullptr; // (n_experts?, dim, hidden_dim)
-	void* _w3 = nullptr; // (n_experts?, hidden_dim, dim) - GLU weights
+  void* _w1 = nullptr; // (n_experts?, hidden_dim, dim)
+  void* _w2 = nullptr; // (n_experts?, dim, hidden_dim)
+  void* _w3 = nullptr; // (n_experts?, hidden_dim, dim) - GLU weights
 
   // kv cache
-	float* _key_cache = nullptr;   // (seq_len, n_kv_heads * head_dim)
-	float* _value_cache = nullptr; // (seq_len, n_kv_heads * head_dim)
+  f16_t* _key_cache = nullptr;   // (seq_len, n_kv_heads * head_dim)
+  f16_t* _value_cache = nullptr; // (seq_len, n_kv_heads * head_dim)
 };
 
 enum class InferenceMode {
@@ -216,16 +223,19 @@ struct Model {
   std::vector<std::shared_ptr<Block>> blocks;
   
   // token embedding table
-	void* token_embedding_table = nullptr; // (vocab_size, dim)
+  void* token_embedding_table = nullptr; // (vocab_size, dim)
   // final norm
-	float* rms_final_weight = nullptr; // (dim,)
-	// classifier weights for the logits, on the last layer
-	void* wcls = nullptr; // (vocab_size, dim)
+  float* rms_final_weight = nullptr; // (dim,)
+  // classifier weights for the logits, on the last layer
+  void* wcls = nullptr; // (vocab_size, dim)
 
-  Model(YALMData& yalm);
+  Model(YALMData& yalm, int context = 0);
   
   void forward(InferenceState& s, int token, int pos, InferenceMode mode = InferenceMode::OUTPUT_LOGITS);
   void cuda();
+
+  //deli:
+  float get_perplexity(InferenceState s);
 
 private:
   void _forward_cpu(InferenceState& s, int token, int pos, InferenceMode mode);
@@ -235,6 +245,27 @@ private:
   Device _device = Device::CPU;
 };
 
+#if DEBUG_MODEL
+struct DebugTensor {
+  enum struct DataType {
+    F32,
+    F16,
+  };
+
+  DebugTensor() = default;
+  DebugTensor(const std::vector<float>& data);
+  DebugTensor(const std::vector<f16_t>& data);
+  DebugTensor& operator=(const DebugTensor& other) = default;
+  float max_err(const DebugTensor& other) const;
+
+  std::vector<float> data_f32;
+  std::vector<f16_t> data_f16;
+  DataType data_type;
+};
+std::map<std::string, DebugTensor>& debug_map_cpu();
+std::map<std::string, DebugTensor>& debug_map_cuda();
+#endif
+
 ////////////////////////////////////////
 // Exposed for tests
 ////////////////////////////////////////
@@ -242,8 +273,8 @@ void attn(
   float* xout,    // (dim,) - output vector
   float* atth,    // (kv_len,) - scratch space to hold attention scores of the sequence
   float* qh,      // (head_dim,) - query vector for this head
-  float* kh,      // (kv_len, n_kv_heads, head_dim) - buffer containing key vectors of the sequence for all KV heads
-  float* vh,      // (kv_len, n_kv_heads, head_dim) - buffer containing value vectors of the sequence for all KV heads
+  f16_t* kh,      // (kv_len, n_kv_heads, head_dim) - buffer containing key vectors of the sequence for all KV heads
+  f16_t* vh,      // (kv_len, n_kv_heads, head_dim) - buffer containing value vectors of the sequence for all KV heads
   int head_dim,   // size of the "key-space"
   int n_kv_heads, // number of kv heads, can be < n_heads (1 is MultiQueryAttention, >1 is GroupedQueryAttention)
   int kv_len      // number of tokens of the sequence we will attend over
@@ -252,23 +283,24 @@ void attn(
 void mha_cpu(
   float* xout,  // (n_heads, head_dim)
   float* att,   // (n_heads, max_seq_len)
-  float* kb,    // (max_seq_len, n_kv_heads, head_dim)
-  float* vb,    // (max_seq_len, n_kv_heads, head_dim)
+  f16_t* kb,    // (max_seq_len, n_kv_heads, head_dim)
+  f16_t* vb,    // (max_seq_len, n_kv_heads, head_dim)
   float* q,     // (n_heads, head_dim)
   int head_dim, int kv_len, int max_seq_len, int n_heads, int n_kv_heads
 );
 void mha_cuda(
   float* xout,  // (n_heads, head_dim)
   float* att,   // (n_heads, max_seq_len)
-  float* kb,    // (max_seq_len, n_kv_heads, head_dim)
-  float* vb,    // (max_seq_len, n_kv_heads, head_dim)
+  f16_t* kb,    // (max_seq_len, n_kv_heads, head_dim)
+  f16_t* vb,    // (max_seq_len, n_kv_heads, head_dim)
   float* q,     // (n_heads, head_dim)
   int head_dim, int kv_len, int max_seq_len, int n_heads, int n_kv_heads
 );
 
 void matmul_cpu(float* xout, float* x, float* w, int n, int d);
 void matmul_cpu(float* xout, float* x, f16_t* w, int n, int d);
-void matmul_cuda(float* xout, float* x, float* w, int n, int d);
+template <typename T>
+void matmul_cuda(float* xout, float* x, T* w, int n, int d);
 
 void ffn_cpu(
   float* xout, float* x, 
@@ -276,9 +308,10 @@ void ffn_cpu(
   int hidden_dim, int dim,
   ActivationType act
 );
+template <typename T>
 void ffn_cuda(
   float* xout, float* x, 
-  float* w1, float* w2, float* w3, 
+  T* w1, T* w2, T* w3, 
   int hidden_dim, int dim,
   ActivationType act
 );

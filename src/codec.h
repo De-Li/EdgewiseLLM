@@ -13,15 +13,15 @@ typedef uint16_t f16_t;
 
 // TODO: Should this be narrowed down to what we actually support for model weight representation?
 enum class DType {
-	F32,
-	F16,
-	BF16,
-	F8E5M2,
-	F8E4M3,
-	I32,
-	I16,
-	I8,
-	U8,
+  F32,
+  F16,
+  BF16,
+  F8E5M2,
+  F8E4M3,
+  I32,
+  I16,
+  I8,
+  U8,
 };
 std::string dtype_to_string(DType dtype);
 size_t dtype_size(DType dtype);

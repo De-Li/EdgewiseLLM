@@ -7,32 +7,70 @@
 #include "immintrin.h"
 #include "f16cintrin.h"
 
+#if defined(__AVX2__) && defined(__F16C__)
+inline float half_to_float(f16_t x) {
+  return _cvtsh_ss(x);
+}
+inline f16_t float_to_half(float x) {
+  return _cvtss_sh(x, 0);
+}
+#else
+inline float half_to_float(f16_t x) {
+  assert(false && "float16 not supported on this platform");
+  return 0.0f;
+}
+inline f16_t float_to_half(float x) {
+  assert(false && "float16 not supported on this platform");
+  return 0;
+}
+#endif
+
+#if DEBUG_MODEL
+#include "fmt/format.h"
+static std::map<std::string, DebugTensor> _debug_map;
+std::map<std::string, DebugTensor>& debug_map_cpu() {
+  return _debug_map;
+}
+template <typename T>
+static std::vector<T> copy_debug_tensor(T* x, size_t size) {
+  std::vector<T> out(size);
+  for (size_t i = 0; i < size; i++) {
+    out[i] = x[i];
+  }
+  return out;
+}
+template <typename T>
+static void save_debug_tensor(const std::string& name, T* x, size_t size) {
+  _debug_map[name] = DebugTensor(copy_debug_tensor<T>(x, size));
+}
+#endif
+
 static void matmul(float* xout, float* x, float* w, int n, int d) {
-	// W (d,n) @ x (n,) -> xout (d,)
-	int i;
+  // W (d,n) @ x (n,) -> xout (d,)
+  int i;
 #pragma omp parallel for private(i)
-	for (i = 0; i < d; i++) {
-		float val = 0.0f;
-		for (int j = 0; j < n; j++) {
-			val += w[i * n + j] * x[j];
-		}
-		xout[i] = val;
-	}
+  for (i = 0; i < d; i++) {
+    float val = 0.0f;
+    for (int j = 0; j < n; j++) {
+      val += w[i * n + j] * x[j];
+    }
+    xout[i] = val;
+  }
 }
 
 // matmul supporting float16 weights via the F16C extension, which allows
 // conversion into float32 values before calculations.
 static void matmul(float* xout, float* x, f16_t* w, int n, int d) {
 #if defined(__AVX2__) && defined(__F16C__)
-	// W (d,n) @ x (n,) -> xout (d,)
+  // W (d,n) @ x (n,) -> xout (d,)
   assert(n % 16 == 0);
-	int i;
+  int i;
 #pragma omp parallel for private(i)
-	for (i = 0; i < d; i++) {
+  for (i = 0; i < d; i++) {
     // Vectorized dot product of w[i][:] and x[:] where w is a packed float16 array.
-		__m256 sumlo = _mm256_setzero_ps();
+    __m256 sumlo = _mm256_setzero_ps();
     __m256 sumhi = _mm256_setzero_ps();
-		for (int j = 0; j < n; j+=16) {
+    for (int j = 0; j < n; j+=16) {
       // Extract the next set of 16 float16 weights from `w` and store them
       // to two separate float32 vectors of width 8 (`wveclo_ps`, `wvechi_ps`)
       __m256i wvec = _mm256_loadu_si256((__m256i*)&w[i * n + j]);
@@ -46,7 +84,7 @@ static void matmul(float* xout, float* x, f16_t* w, int n, int d) {
       // Compute vectorized FMAs: sumlo += wveclo * xveclo, sumhi += wvechi * xvechi
       sumlo = _mm256_fmadd_ps(wveclo_ps, xveclo, sumlo);
       sumhi = _mm256_fmadd_ps(wvechi_ps, xvechi, sumhi);
-		}
+    }
     // Horizontally reduce width-8 float32 vectors sumlo, sumhi to a scalar.
     __m256 sum8 = _mm256_add_ps(sumlo, sumhi);              // sum8[0:8] = sumlo[0:8] + sumhi[0:8]
     __m128 sum4 = _mm_add_ps(                               // sum4[0:4] = sum8[0:4] + sum8[4:8]
@@ -54,8 +92,8 @@ static void matmul(float* xout, float* x, f16_t* w, int n, int d) {
       _mm256_extractf128_ps(sum8, 1)
     );
     __m128 sum1 = _mm_dp_ps(sum4, _mm_set1_ps(1.0f), 0xf1); // sum1[0] = dot(sum4, [1,1,1,1])
-		xout[i] = _mm_cvtss_f32(sum1);
-	}
+    xout[i] = _mm_cvtss_f32(sum1);
+  }
 #else
   assert(false && "float16 not supported on this platform");
 #endif
@@ -115,31 +153,31 @@ static void softmax(float* o, float* x, int size) {
 }
 
 inline float gelu(float x) {
-	return 0.5f * x * (1.0f + tanhf(0.797885f * (x + 0.044715f * x * x * x)));
+  return 0.5f * x * (1.0f + tanhf(0.797885f * (x + 0.044715f * x * x * x)));
 }
 
 inline float silu(float x) {
-	return x / (1.0f + expf(-x));
+  return x / (1.0f + expf(-x));
 }
 
 inline float clip(float x, float v) {
-	return x < -v ? -v : (x > v ? v : x);
+  return x < -v ? -v : (x > v ? v : x);
 }
 
 // TODO annotate me
 static void rope(float* vec, int d, int head_dim, int pos, float theta, int rotary_dim) {
-	for (int i = 0; i < d; i += 2) {
-		int j_head = i % head_dim;
-		float freq = j_head >= rotary_dim ? 0.f : 1.0f / powf(theta, (float)j_head / (float)rotary_dim);
-		float val = pos * freq;
-		float fcr = cosf(val);
-		float fci = sinf(val);
+  for (int i = 0; i < d; i += 2) {
+    int j_head = i % head_dim;
+    float freq = j_head >= rotary_dim ? 0.f : 1.0f / powf(theta, (float)j_head / (float)rotary_dim);
+    float val = pos * freq;
+    float fcr = cosf(val);
+    float fci = sinf(val);
 
-		float v0 = vec[i];
-		float v1 = vec[i + 1];
-		vec[i] = v0 * fcr - v1 * fci;
-		vec[i + 1] = v0 * fci + v1 * fcr;
-	}
+    float v0 = vec[i];
+    float v1 = vec[i + 1];
+    vec[i] = v0 * fcr - v1 * fci;
+    vec[i + 1] = v0 * fci + v1 * fcr;
+  }
 }
 
 // Compute next value in a sequence for a single causal self-attention head.
@@ -147,8 +185,8 @@ void attn(
   float* xout,    // (dim,) - output vector
   float* atth,    // (kv_len,) - scratch space to hold attention scores of the sequence
   float* qh,      // (head_dim,) - query vector for this head
-  float* kh,      // (kv_len, n_kv_heads, head_dim) - buffer containing key vectors of the sequence for all KV heads
-  float* vh,      // (kv_len, n_kv_heads, head_dim) - buffer containing value vectors of the sequence for all KV heads
+  f16_t* kh,      // (kv_len, n_kv_heads, head_dim) - buffer containing key vectors of the sequence for all KV heads
+  f16_t* vh,      // (kv_len, n_kv_heads, head_dim) - buffer containing value vectors of the sequence for all KV heads
   int head_dim,   // size of the "key-space"
   int n_kv_heads, // number of kv heads, can be < n_heads (1 is MultiQueryAttention, >1 is GroupedQueryAttention)
   int kv_len      // number of tokens of the sequence we will attend over
@@ -158,7 +196,7 @@ void attn(
   for (int t = 0; t < kv_len; ++t) {
     float score = 0.0f;
     for (int i = 0; i < head_dim; ++i) {
-      score += qh[i] * kh[t * kv_stride + i];
+      score += qh[i] * half_to_float(kh[t * kv_stride + i]);
     }
     score /= sqrtf(head_dim);
     atth[t] = score;
@@ -171,7 +209,7 @@ void attn(
   for (int i = 0; i < head_dim; ++i) {
     float vi = 0.0f;
     for (int t = 0; t < kv_len; ++t) {
-      vi += atth[t] * vh[t * kv_stride + i];
+      vi += atth[t] * half_to_float(vh[t * kv_stride + i]);
     }
     xout[i] = vi;
   }
@@ -185,7 +223,7 @@ template <typename T>
 void Block::_block_cpu(
   InferenceState& s,  // inference state
   int pos,            // index of the current token in the sequence
-  int kv_sink,
+  int kv_sink,        // number of sink tokens currently in the KV cache
   int kv_pos,         // index of the current token in the kv cache, must be in [0..kv_len) since kv cache is a ring buffer
   int kv_len          // number of tokens in the kv cache that we will attend over
 ) const {
@@ -222,12 +260,28 @@ void Block::_block_cpu(
   rope(s.k(), kv_dim, c.head_dim, pos, c.rope_theta, c.rotary_dim);
   
   // key and value point to the kv cache
-  float* kb = key_cache();
-  float* vb = value_cache();
+  f16_t* kb = key_cache();
+  f16_t* vb = value_cache();
   // update kv cache
   for (int i = 0; i < kv_dim; ++i) {
-    kb[kv_pos * kv_dim + i] = s.k()[i];
-    vb[kv_pos * kv_dim + i] = s.v()[i];
+    kb[kv_pos * kv_dim + i] = float_to_half(s.k()[i]);
+    vb[kv_pos * kv_dim + i] = float_to_half(s.v()[i]);
+  }
+
+  // Sink tokens remain untouched while the rest of the KV cache is incrementally 
+  // replaced in ring order, but sink i must always be positioned (max_seq_len - i)
+  // away from current timestep. Hence, each forward pass, rotate sink tokens 
+  // forward by 1. See https://arxiv.org/abs/2309.17453 for more.
+  for (int r = 0; r < kv_sink; r++) {
+    for (int i = 0; i < kv_dim; ++i) {
+      s.k()[i] = half_to_float(kb[r * kv_dim + i]);
+    }
+
+    rope(s.k(), kv_dim, c.head_dim, 1, c.rope_theta, c.rotary_dim);
+
+    for (int i = 0; i < kv_dim; i++) {
+      kb[r * kv_dim + i] = float_to_half(s.k()[i]);
+    }
   }
 
   // Multihead attention. Iterate over all heads.
@@ -236,8 +290,8 @@ void Block::_block_cpu(
 #pragma omp parallel for private(h)
   for (h = 0; h < c.n_heads; h++) {
     int kv_head_offset = (h / q_per_kv_head) * c.head_dim;
-    float* kh = kb + kv_head_offset;
-    float* vh = vb + kv_head_offset;
+    f16_t* kh = kb + kv_head_offset;
+    f16_t* vh = vb + kv_head_offset;
     attn(s.xb2(h), s.att(h), s.q(h), kh, vh, c.head_dim, c.n_kv_heads, kv_len);
   }
 
@@ -286,8 +340,8 @@ void Block::_block_cpu(
 void mha_cpu(
   float* xout,  // (n_heads, head_dim)
   float* att,   // (n_heads, max_seq_len)
-  float* kb,    // (max_seq_len, n_kv_heads, head_dim)
-  float* vb,    // (max_seq_len, n_kv_heads, head_dim)
+  f16_t* kb,    // (max_seq_len, n_kv_heads, head_dim)
+  f16_t* vb,    // (max_seq_len, n_kv_heads, head_dim)
   float* q,     // (n_heads, head_dim)
   int head_dim, int kv_len, int max_seq_len, int n_heads, int n_kv_heads
 ) {
@@ -297,8 +351,8 @@ void mha_cpu(
 #pragma omp parallel for private(h)
   for (h = 0; h < n_heads; h++) {
     int kv_head_offset = (h / q_per_kv_head) * head_dim;
-    float* kh = kb + kv_head_offset;
-    float* vh = vb + kv_head_offset;
+    f16_t* kh = kb + kv_head_offset;
+    f16_t* vh = vb + kv_head_offset;
     attn(
       xout + head_dim * h, att + max_seq_len * h, q + head_dim * h, 
       kh, vh, head_dim, n_kv_heads, kv_len
@@ -360,14 +414,10 @@ void Model::_copy_embedding(InferenceState& s, int token) {
       break;
     }
     case DType::F16: {
-#if defined(__AVX2__) && defined(__F16C__)
       f16_t* emb = static_cast<f16_t*>(token_embedding_table);
       for (int i = 0; i < c.dim; i+=1) {
-        s.x()[i] = _cvtsh_ss(emb[token * c.dim + i]);
+        s.x()[i] = half_to_float(emb[token * c.dim + i]);
       }
-#else
-      assert(false && "float16 not supported on this platform");
-#endif
       break;
     }
     default: {
@@ -382,13 +432,16 @@ void Model::_forward_cpu(InferenceState& s, int token, int pos, InferenceMode mo
   // copy the token embedding into `x`
   _copy_embedding(s, token);
 
-  // TODO: attention sinks
-	int kv_pos = pos % c.max_seq_len;
-	int kv_len = pos >= c.max_seq_len ? c.max_seq_len : pos + 1;
-  int fillingtemp = 0;
+  // When decoding past the context length, keep the first few tokens in the KV cache
+  // untouched as "attention sinks" while replacing the rest in ring order.
+  // See StreamingLLM (https://arxiv.org/pdf/2309.17453) for more.
+  int kv_sink = pos >= c.max_seq_len ? KV_SINKS : 0;
+  int kv_pos = kv_sink + (pos - kv_sink) % (c.max_seq_len - kv_sink);
+  int kv_len = pos >= c.max_seq_len ? c.max_seq_len : pos + 1;
+
   // forward all layers in order
   for (auto b : blocks) {
-    b->block(s, pos, fillingtemp, kv_pos, kv_len);
+    b->block(s, pos, kv_sink, kv_pos, kv_len);
   }
 
   if (mode == InferenceMode::HYDRATE_KV_CACHE) {

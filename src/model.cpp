@@ -11,29 +11,29 @@
 
 #include "immintrin.h"
 
+#include <cmath>
+
 using json = nlohmann::json;
 
 void Config::from_yalm(YALMData& yalm, int context) {
   dim = std::stoi(yalm.metadata.at("dim").get<std::string>());
-	hidden_dim = std::stoi(yalm.metadata.at("hidden_dim").get<std::string>());
-	head_dim = std::stoi(yalm.metadata.at("head_dim").get<std::string>());
-	n_layers = std::stoi(yalm.metadata.at("n_layers").get<std::string>());
-	n_heads = std::stoi(yalm.metadata.at("n_heads").get<std::string>());
-	n_kv_heads = std::stoi(yalm.metadata.at("n_kv_heads").get<std::string>());
-	vocab_size = std::stoi(yalm.metadata.at("vocab_size").get<std::string>());
+  hidden_dim = std::stoi(yalm.metadata.at("hidden_dim").get<std::string>());
+  head_dim = std::stoi(yalm.metadata.at("head_dim").get<std::string>());
+  n_layers = std::stoi(yalm.metadata.at("n_layers").get<std::string>());
+  n_heads = std::stoi(yalm.metadata.at("n_heads").get<std::string>());
+  n_kv_heads = std::stoi(yalm.metadata.at("n_kv_heads").get<std::string>());
+  vocab_size = std::stoi(yalm.metadata.at("vocab_size").get<std::string>());
 
-	// for now limit seq_len to 4096 to avoid KV cache OOM for models like Mistral since window size isn't correctly specified
-	max_seq_len = std::min(std::stoi(yalm.metadata.at("max_seq_len").get<std::string>()), 4096);
+  // for now limit seq_len to 4096 to avoid KV cache OOM for models like Mistral since window size isn't correctly specified
+  max_seq_len = std::min(std::stoi(yalm.metadata.at("max_seq_len").get<std::string>()), 4096);
   if (context) {
-		max_seq_len = context;
-	}
-  max_seq_len = 1024;
-  std::cout << "max_seq_len: " << max_seq_len << std::endl;
+    max_seq_len = context;
+  }
 
-	rope_theta = std::stof(yalm.metadata.at("rope_theta").get<std::string>());
-	rotary_dim = std::stoi(yalm.metadata.at("rotary_dim").get<std::string>());
+  rope_theta = std::stof(yalm.metadata.at("rope_theta").get<std::string>());
+  rotary_dim = std::stoi(yalm.metadata.at("rotary_dim").get<std::string>());
 
-	norm_eps = std::stof(yalm.metadata.value("norm_eps", "1e-5"));
+  norm_eps = std::stof(yalm.metadata.value("norm_eps", "1e-5"));
 
   std::string act_str = yalm.metadata.value("act_type", "gelu");
   if (act_str == "gelu") {
@@ -45,7 +45,7 @@ void Config::from_yalm(YALMData& yalm, int context) {
     act = ActivationType::GELU;
   }
 
-	std::string norm_type_str = yalm.metadata.value("norm_type", "rmsnorm");
+  std::string norm_type_str = yalm.metadata.value("norm_type", "rmsnorm");
   if (norm_type_str == "rmsnorm") {
     norm_type = LayerNormType::RMSNorm;
   } else {
@@ -53,7 +53,7 @@ void Config::from_yalm(YALMData& yalm, int context) {
     norm_type = LayerNormType::RMSNorm;
   }
 
-	qkv_clip = yalm.metadata.contains("qkv_clip") ? std::stof(yalm.metadata.at("qkv_clip").get<std::string>()) : FLT_MAX;
+  qkv_clip = yalm.metadata.contains("qkv_clip") ? std::stof(yalm.metadata.at("qkv_clip").get<std::string>()) : FLT_MAX;
 
   std::string dtype = yalm.metadata.at("dtype").get<std::string>();
   // TODO: support fp8
@@ -77,7 +77,7 @@ size_t Config::active_bytes(size_t pos) const {
   bytes_per_block += n_heads * head_dim * dim * weight_size; // wo
   bytes_per_block += 3 * dim * hidden_dim * weight_size; // w1, w2, w3
   size_t kv_len = std::min(static_cast<size_t>(max_seq_len), pos + 1);
-  size_t kv_entry_size = sizeof(float);
+  size_t kv_entry_size = sizeof(f16_t);
   bytes_per_block += 2 * kv_len * n_kv_heads * head_dim * kv_entry_size; // key_cache, value_cache
 
   size_t bytes = 0;
@@ -120,6 +120,7 @@ const Tensor* get_tensor(const YALMData& yalm, const std::string& key) {
 };
 
 Block::Block(
+  int layer_i,
   const std::shared_ptr<Config> config,
   const Tensor* rms_att_weight,
   const Tensor* rms_ffn_weight,
@@ -131,6 +132,9 @@ Block::Block(
   const Tensor* w2,
   const Tensor* w3
 ) {
+#if DEBUG_MODEL
+  _layer_i = layer_i;
+#endif
   _config = config;
   switch (config->weight_dtype) {
     case DType::F32:
@@ -174,8 +178,8 @@ Block::Block(
     w3, config->weight_dtype, {config->hidden_dim, config->dim, 0, 0}
   );
 
-  _key_cache = new float[config->max_seq_len * config->n_kv_heads * config->head_dim]();
-  _value_cache = new float[config->max_seq_len * config->n_kv_heads * config->head_dim]();
+  _key_cache = new f16_t[config->max_seq_len * config->n_kv_heads * config->head_dim]();
+  _value_cache = new f16_t[config->max_seq_len * config->n_kv_heads * config->head_dim]();
 }
 
 Block::~Block() {
@@ -210,10 +214,9 @@ void Block::cuda() {
   _w3 = upload_cuda(_w3, _config->hidden_dim * _config->dim * weight_size);
 
   // kv cache
-  _key_cache = static_cast<float*>(upload_cuda(_key_cache, _config->max_seq_len * _config->n_kv_heads * _config->head_dim * sizeof(float)));
-  _value_cache = static_cast<float*>(upload_cuda(_value_cache, _config->max_seq_len * _config->n_kv_heads * _config->head_dim * sizeof(float)));
+  _key_cache = static_cast<f16_t*>(upload_cuda(_key_cache, _config->max_seq_len * _config->n_kv_heads * _config->head_dim * sizeof(f16_t)));
+  _value_cache = static_cast<f16_t*>(upload_cuda(_value_cache, _config->max_seq_len * _config->n_kv_heads * _config->head_dim * sizeof(f16_t)));
 }
-
 
 void Block::block(
   InferenceState& s,  // inference state
@@ -317,9 +320,9 @@ void InferenceState::cuda() {
   register_cuda_host(_logits, _config->vocab_size * sizeof(float));
 }
 
-Model::Model(YALMData& yalm) {
+Model::Model(YALMData& yalm, int context) {
   config = std::make_shared<Config>();
-  config->from_yalm(yalm);
+  config->from_yalm(yalm, context);
   std::cout << "loading model with dtype: " << dtype_to_string(config->weight_dtype) << std::endl;
 
   token_embedding_table = check_tensor(
@@ -330,6 +333,7 @@ Model::Model(YALMData& yalm) {
 
   for (int i = 0; i < config->n_layers; ++i) {
     blocks.emplace_back(std::make_shared<Block>(
+      i,
       config,
       get_tensor(yalm, fmt::format("model.layers.{}.attn.norm.weight", i)),
       get_tensor(yalm, fmt::format("model.layers.{}.mlp.norm.weight", i)),
@@ -383,3 +387,56 @@ void Model::forward(InferenceState& s, int token, int pos, InferenceMode mode) {
     _forward_cpu(s, token, pos, mode);
   }
 }
+/*
+float Model::get_perplexity(InferenceState s){
+   if (s.logits() == nullptr) {
+        std::cerr << "Error: logProbs is empty.\n";
+        return std::numeric_limits<double>::infinity();
+    }
+
+    float sumLogProb = 0.0;
+    const float* logits = s.logits();
+    for(logit:s.logits()){
+      sumLogProb += logit;
+    }
+
+    // average log probability
+    float avgLogProb = sumLogProb / s.size();
+
+    // perplexity = exp(-average_log_probability)
+    return std::exp(-avgLogProb);
+}
+*/
+#if DEBUG_MODEL
+DebugTensor::DebugTensor(const std::vector<float>& data) {
+  data_f32 = data;
+  data_type = DataType::F32;
+}
+DebugTensor::DebugTensor(const std::vector<f16_t>& data) {
+  data_f16 = data;
+  data_type = DataType::F16;
+}
+
+float DebugTensor::max_err(const DebugTensor& other) const {
+  if (data_type != other.data_type) {
+    return -1;
+  }
+  if (data_type == DataType::F32) {
+    float max_err = 0;
+    for (size_t i = 0; i < data_f32.size(); i++) {
+      max_err = std::max(max_err, std::abs(data_f32[i] - other.data_f32[i]));
+    }
+    return max_err;
+  } else {
+#if defined(__F16C__)
+    float max_err = 0;
+    for (size_t i = 0; i < data_f16.size(); i++) {
+      max_err = std::max(max_err, std::abs(_cvtsh_ss(data_f16[i]) - _cvtsh_ss(other.data_f16[i])));
+    }
+    return max_err;
+#else
+  assert(false && "float16 not supported on this platform");
+#endif
+  }
+}
+#endif

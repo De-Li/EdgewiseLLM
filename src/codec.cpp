@@ -102,10 +102,10 @@ int YALMData::from_file(const std::string& filename) {
   }
 
   struct stat st;
-	if (fstat(fd, &st) != 0) {
-		close(fd);
-		return -1;
-	}
+  if (fstat(fd, &st) != 0) {
+    close(fd);
+    return -1;
+  }
   
   size = st.st_size;
   data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
@@ -115,8 +115,8 @@ int YALMData::from_file(const std::string& filename) {
   }
 
 #ifdef __linux__
-	// increases readahead buffer size, resulting in faster cold loads
-	posix_fadvise(fd, 0, size, POSIX_FADV_SEQUENTIAL);
+  // increases readahead buffer size, resulting in faster cold loads
+  posix_fadvise(fd, 0, size, POSIX_FADV_SEQUENTIAL);
 #endif
 
   close(fd); // fd can be closed after mmap returns without invalidating the mapping
@@ -134,7 +134,7 @@ int YALMData::from_file(const std::string& filename) {
   }
 
   char* json_ptr = (char*)data + sizeof(uint64_t);
-	void* bytes_ptr = (char*)data + sizeof(uint64_t) + json_size;
+  void* bytes_ptr = (char*)data + sizeof(uint64_t) + json_size;
   size_t bytes_size = size - sizeof(uint64_t) - json_size;
 
   json_ptr[json_size - 1] = 0; // null-terminate the JSON string
